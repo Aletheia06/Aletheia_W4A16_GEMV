@@ -497,3 +497,74 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 ```
+我使用了Cloud Studio进行测试，使用T4，最后测试结果是  
+```➜  Aletheia_W4A16_GEMV git:(main) ✗ python test_local.py
+[current stream] K=128, N=1, seed=20261006: max_abs=0.00114655, mean_abs=0.00114655, cosine=1.00000000
+PASS
+[current stream] K=256, N=5, seed=20261007: max_abs=0.00763154, mean_abs=0.00286884, cosine=0.99999946
+PASS
+[current stream] K=384, N=129, seed=20261008: max_abs=0.0532837, mean_abs=0.00868326, cosine=0.99999732
+FAIL: Tensor-likes are not close!
+
+Mismatched elements: 2 / 129 (1.6%)
+Greatest absolute difference: 0.013995647430419922 at index (0, 54) (up to 0.01 allowed)
+Greatest relative difference: 0.06749846786260605 at index (0, 8) (up to 0.01 allowed)
+[current stream] K=640, N=257, seed=20261009: max_abs=0.0728645, mean_abs=0.0125813, cosine=0.99999279
+FAIL: Tensor-likes are not close!
+
+Mismatched elements: 8 / 257 (3.1%)
+Greatest absolute difference: 0.05700278282165527 at index (0, 131) (up to 0.01 allowed)
+Greatest relative difference: 0.0955512747168541 at index (0, 253) (up to 0.01 allowed)
+[current stream] K=4096, N=4096, seed=20261010: max_abs=0.93615, mean_abs=0.0804846, cosine=0.99995691
+FAIL: Tensor-likes are not close!
+
+Mismatched elements: 1342 / 4096 (32.8%)
+Greatest absolute difference: 0.9361495971679688 at index (0, 2775) (up to 0.01 allowed)
+Greatest relative difference: 59.207298278808594 at index (0, 1581) (up to 0.01 allowed)
+[current stream] K=4096, N=11008, seed=20261011: max_abs=0.970188, mean_abs=0.0771, cosine=0.99995804
+FAIL: Tensor-likes are not close!
+
+Mismatched elements: 3616 / 11008 (32.8%)
+Greatest absolute difference: 0.9701881408691406 at index (0, 3141) (up to 0.01 allowed)
+Greatest relative difference: 50.248226165771484 at index (0, 6464) (up to 0.01 allowed)
+[current stream] K=11008, N=4096, seed=20261012: max_abs=1.94633, mean_abs=0.212029, cosine=0.99988663
+FAIL: Tensor-likes are not close!
+
+Mismatched elements: 2243 / 4096 (54.8%)
+Greatest absolute difference: 1.9463348388671875 at index (0, 1485) (up to 0.01 allowed)
+Greatest relative difference: 12.876323699951172 at index (0, 426) (up to 0.01 allowed)
+[non-default stream] K=4096, N=129, seed=20261013: max_abs=0.401947, mean_abs=0.0757253, cosine=0.99995953
+FAIL: Tensor-likes are not close!
+
+Mismatched elements: 48 / 129 (37.2%)
+Greatest absolute difference: 0.401947021484375 at index (0, 28) (up to 0.01 allowed)
+Greatest relative difference: 0.25248047709465027 at index (0, 76) (up to 0.01 allowed)
+
+结果：2/8 通过
+```
+误差非常大，可以看到是之前half计算的时候留下的误差，所以需要修改一下前面的half，改成用float计算，减少误差  
+只需要修改一下sum的类型为float，最后再来一个float2half即可  
+最后得到的测试结果是  
+```
+➜  Aletheia_W4A16_GEMV git:(main) ✗ python test_local.py
+[current stream] K=128, N=1, seed=20261006: max_abs=0.00080657, mean_abs=0.00080657, cosine=1.00000000
+PASS
+[current stream] K=256, N=5, seed=20261007: max_abs=0.000229478, mean_abs=0.000166845, cosine=1.00000000
+PASS
+[current stream] K=384, N=129, seed=20261008: max_abs=0.00378895, mean_abs=0.000653715, cosine=1.00000000
+PASS
+[current stream] K=640, N=257, seed=20261009: max_abs=0.00366879, mean_abs=0.000662782, cosine=0.99999988
+PASS
+[current stream] K=4096, N=4096, seed=20261010: max_abs=0.015377, mean_abs=0.00173919, cosine=0.99999994
+PASS
+[current stream] K=4096, N=11008, seed=20261011: max_abs=0.0154266, mean_abs=0.00167455, cosine=1.00000000
+PASS
+[current stream] K=11008, N=4096, seed=20261012: max_abs=0.0156364, mean_abs=0.00279664, cosine=1.00000000
+PASS
+[non-default stream] K=4096, N=129, seed=20261013: max_abs=0.00671959, mean_abs=0.00144952, cosine=1.00000012
+PASS
+
+结果：8/8 通过
+```
+通过了，期待在学校的服务器也能跑起来  
+**这一份是还没有经过优化的，知识实现了基础的功能，先看看能不能拿个基础分hhh。后面会继续进行分析和调优**  

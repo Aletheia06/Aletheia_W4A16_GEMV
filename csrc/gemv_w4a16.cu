@@ -7,7 +7,7 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
         return;
     }
 
-    half sum = 0.0f;
+    float sum = 0.0f;
     for(int k = 0;k < K;k++) {
         // 因为这里的w_q是打包的
         // 所以一次拿出来的是2个
@@ -34,7 +34,7 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
         float weight = (q - z) * s;
         sum += xv * weight;
     }
-    y[i] = sum;
+    y[i] = __float2half_rn(sum);
 }
 
 torch::Tensor gemv_w4a16(
