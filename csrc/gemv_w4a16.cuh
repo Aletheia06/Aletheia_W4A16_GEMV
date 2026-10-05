@@ -8,11 +8,10 @@
 #include <c10/cuda/CUDAGuard.h>
 
 
-__global__ void gemv_kernel(
-    const half *x, 
-    const u_int8_t *w_q, 
-    const half *scales, 
-    const half *zeros, 
-    half *y, 
-    int K, int N, 
-    int group_size);
+torch::Tensor gemv_w4a16(
+    const torch::Tensor &x,
+    const torch::Tensor &w_q,
+    const torch::Tensor &scales,
+    const torch::Tensor &zeros,
+    int group_size
+);

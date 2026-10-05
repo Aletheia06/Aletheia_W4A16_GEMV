@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include "gemv_w4a16.cuh"
 
-PYBIND11_MODULE(gemv_w4a16, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "gemv_w4a16",
         &gemv_w4a16,
