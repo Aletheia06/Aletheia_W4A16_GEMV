@@ -760,3 +760,48 @@ ncu   --target-processes all   --kernel-name regex:gemv_kernel   --launch-skip 4
           higher-throughput equivalent, the achieved FP32 performance could be increased by up to 34% (relative to its  
           current performance). 
 ```
+
+也就是说，我们必须优化一下我们的计算过程。但是计算的公式他就是那么简单，还怎么优化呢？  
+再看看我们的公式，我们的公式就是(q - z) * s，看看代码  
+```
+        // 这里的m代表当前包内的第m个INT4权重，范围是0-7，因为一个包就是8个INT4
+        // 然后我们用按位与
+        // 把4位提取出来，给q
+        for(int m = 0; m < 8; m++) {
+            int q = (packed >> (m * 4)) & 0xF;
+
+            //必须先按照half的位模式来解释，再转成float
+            unsigned short bits = (packed_x >> (m * 16)) & 0xFFFFu;
+            float xv = __half2float(__ushort_as_half(bits));
+
+            float weight = (q - z) * s;
+            sum += xv * weight;
+        }
+```
+**哦?突然发现这里面的z和s都是不变的，也就是每次循环的时候我们变得地方只有q是变化的，z和s都是不变的，是外面的。那么我们是不是可以优化掉这部分的计算呢？也就是我们可以把公式变成qs - zs，然后zs在外面算好，后面可以复用好几次。**  
+**另外，Nvidia的文档可以发现，他有一个叫做FMA的东西，这东西好啊，它可以把权重的两部计算合并成一次，比如我们前面的q * s - z*s,z*s直接看成一个数字a，那相当于计算q*s-a**，本来是两步的，但是FMA可以合并成一次，接口是__fmaf_rn(a,b,c)，计算a\*b+c。  
+那么前面所有的公式就可以变成FMA(q, s, -zs)  
+那么我们的代码就可以改成  
+```
+        float z = __half2float(zeros[group_index]);
+        float s = __half2float(scales[group_index]);
+
+        // 在外面计算好，复用
+        float zs = -z * s ;
+
+        // 这里的m代表当前包内的第m个INT4权重，范围是0-7，因为一个包就是8个INT4
+        // 然后我们用按位与
+        // 把4位提取出来，给q
+        for(int m = 0; m < 8; m++) {
+            int q = (packed >> (m * 4)) & 0xF;
+
+            //必须先按照half的位模式来解释，再转成float
+            unsigned short bits = (packed_x >> (m * 16)) & 0xFFFFu;
+            float xv = __half2float(__ushort_as_half(bits));
+
+            float weight = __fmaf_rn(static_cast<float>(q), s, zs);
+            sum += xv * weight;
+        }
+```
+
+进行测试，有点失望，时间几乎没什么变化，只减少了3.4%，现在的利用率大概48.18%  

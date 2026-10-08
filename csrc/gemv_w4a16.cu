@@ -41,6 +41,9 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
         float z = __half2float(zeros[group_index]);
         float s = __half2float(scales[group_index]);
 
+        // 在外面计算好，复用
+        float zs = -z * s ;
+
         // 这里的m代表当前包内的第m个INT4权重，范围是0-7，因为一个包就是8个INT4
         // 然后我们用按位与
         // 把4位提取出来，给q
@@ -51,7 +54,7 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
             unsigned short bits = (packed_x >> (m * 16)) & 0xFFFFu;
             float xv = __half2float(__ushort_as_half(bits));
 
-            float weight = (q - z) * s;
+            float weight = __fmaf_rn(static_cast<float>(q), s, zs);
             sum += xv * weight;
         }
     }
