@@ -135,4 +135,420 @@ ncu \
 看到这里的Duration是966.99us，计算下来，有效带宽大概是9.24GB/s，但是我查了一下，RTX5060 Laptop的峰值显存带宽能达到384GB/s，也就是我的利用率只有2.4%哈哈哈  
 先看看有哪些地方可以提升的，我们现在看GPU有没有足够的并行工作。这部分就看block的数量，thread的数量和实际驻留的warp数量。这几个指标在报告中都可以看到。比如启动了多少个block，这是grid size，这里看到我的grid size是32；然后看block size，也就是每个block有多少个线程，我这里是128，感觉偏少了；然后是驻留的warp，这个要看Achieved Occupancy，他的意思是运行时实际平均驻留的warp占硬件上限的比例，我这里只有11.19%。  
 我一开始以为的是，每个block的线程数不够多有影响，不过查询了一下发现我理解不对。因为原来的thread是128，有32个block。现在thread有256，block就只要16个；**然而一个block只能交给一个SM执行，而我的GPU有26个SM，32个block能让全部的SM分到任务，如果变成16个，反而有一些SM会空闲**。SM是流式多处理器，GPU把block分配给SM，SM再以warp为单位执行其中的线程。  
-看来需要换一个思路了。我们要提升实际的warp驻留率，就需要给GPU提供更多可以同时执行的warp
+看来需要换一个思路了。我们要提升实际的warp驻留率，就需要给GPU提供更多可以同时执行的warp。  
+**题目提示了可以用__shfl_down_sync。我需要理解一下什么是__shfl_down_sync**。查了一下，这个东西可以让一个线程直接取得同一warp内另一个线程的值，无需先写到共享内存。比如说每个线程都有自己的float sum，32个线程都执行了
+```
+float other = __shfl_down_sync(0xffffffffu, sum, 16);sum += other;
+```
+warp内，线程编号叫做lane，范围是0-31,这里的参数，0xffffffffu是32位全1，也就是整个warp的32个线程都参加，sum是每个线程提供自己的部分和，16是读取自身lane编号加16的线程的值。  
+这个特性，有点像之前的合作求和。比如第一个加第129个，第二个加第130个，一直到第128个加第256个，现在就把256个的和分散到前面128个了；然后继续第一个加第65个，直到第64个加第128个；以此类推，最后就是都到第一个了。这个叫**树形归约**  
+我们利用这个特点来对原来的算子进行修改。这里修改的原因就是，我一开始设计的是block中的一个thread负责计算一个元素，那么就需要一整行的数据，看我们之前的这个公式  
+$$
+Y[n] = \sum_{k=0}^{K-1}
+X[k]\,
+\left(q_{n,k} - Z[n,\lfloor k/G \rfloor]\right)\,
+S[n,\lfloor k/G \rfloor]
+$$
+
+就是说一个Y[i]需要遍历一整行的X，还需要一些Q和Z。之前这个工作全是一个thread做的，就是他需要完成4096次计算。我们现在让几个thread一起合作来完成这个事情  
+首先需要知道当前线程在warp中的编号。一个warp有32个thread，所以lane就是threadIdx.x % 32，而当前的warp在block中的编号warp_id就是threadIdx.x / 32了。另外，每个block中的warps应该是blockDim.x / 32。然后我们需要知道当前是哪一个warp  
+所以用i表示，i就是blockIdx.x * warps_per_block + warp_id。  
+在计算的时候，每个线程只计算这一行的一部分，比如lane0计算k = 32, 64,96,128这样，lane1就计算k = 1, 33, 65这样。然后后面再合并同一warp内的32个部分和。最后的完整的和存在lane0  
+不过这样的话意味着每个warp计算一个输出，因此我们需要按照warp的数量来计算blocks   
+新代码是  
+```
+#include <cuda_runtime.h>
+#include "gemv_w4a16.cuh"
+__global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scales, const half *zeros, half *y, int K, int N, int group_size) {
+    // 现在计算当前的线程再warp中的编号
+    int lane = threadIdx.x % 32;
+    // 然后计算当前warp在block内的编号
+    int warp_id = threadIdx.x / 32;
+    // 计算每个block有多少个warp
+    int warps_per_block = blockDim.x / 32;
+    // 同一个warp内的32个线程计算同一行i
+    // 这里的i就是当前warp的全局编号
+    // 所以也相当于行号了
+    int i = blockIdx.x * warps_per_block + warp_id;
+    if(i >= N) {
+        return;
+    }
+
+    float sum = 0.0f;
+    // 这里改成32个为stride来计算，后面合并
+    for(int k = lane;k < K;k += 32) {
+        // 因为这里的w_q是打包的
+        // 所以一次拿出来的是2个
+        const uint8_t w_q_of_2 = w_q[i * K/2 + k/2];
+        // 需要根据奇数偶数来判断拿哪个
+        // q代表现在要用的权重
+        int q = 0;
+        if(k % 2 == 0) {
+            q = w_q_of_2 & 0xF;
+        }
+        else {
+            q = (w_q_of_2 >> 4) & 0xF;
+        }
+
+        // 现在还需要知道当前的权重属于哪个组
+        int group_index = i * K / group_size + k / group_size;
+
+        // 根据组号得到z和s
+        // 顺便补一下之前忘记的转换
+        float z = __half2float(zeros[group_index]);
+        float s = __half2float(scales[group_index]);
+        // 拿到现在的x
+        float xv = __half2float(x[k]);
+        
+        float weight = (q - z) * s;
+        sum += xv * weight;
+    }
+
+    // 现在每个线程的sum都是自己的lane和32结合的产物
+    // 也就是这个sum就是第lane, lane + 32, lane + 64 ...的和
+    // 所以接下来合并
+    for(int j = 16;j > 0;j /= 2) {
+        // 这一行就是共享大家（warp内）的sum
+        // 然后每个线程都和比自己大16的加起来
+        // 变成第0个和第16个合并，第一个和第17个合并...
+        // 后面只剩下0到15
+        // 然后继续按照8为步长合并
+        // 以此类推一直到1
+        sum += __shfl_down_sync(0xffffffffu, sum, j);
+    }
+
+    // 最后大家的都加到了第0个上去
+    if(lane == 0) {
+        y[i] = __float2half_rn(sum);
+    }
+}
+
+torch::Tensor gemv_w4a16(
+    const torch::Tensor &x,
+    const torch::Tensor &w_q,
+    const torch::Tensor &scales,
+    const torch::Tensor &zeros,
+    int group_size
+) {
+
+    // 使用x所在的CUDA设备
+    c10::cuda::CUDAGuard guard(x.device());
+
+    // 根据x的外形得出长度K
+    int K = x.size(1);
+    // 根据w_q的外形得出长度N
+    int N = w_q.size(0);
+
+    // 因为我们需要的返回值是torch类型的
+    // 所以这里需要在这个设备上分配FP16输出，形状是(1, N)
+    auto y = torch::empty({1, N}, x.options());
+
+    // 后面这几步全部都是为了把Tensor转成显存指针
+    // 让kernel能用
+    const half *x_ptr = reinterpret_cast<const half *>(x.data_ptr<at::Half>());
+    const uint8_t *w_ptr = w_q.data_ptr<uint8_t>();
+    const half *s_ptr = reinterpret_cast<const half *>(scales.data_ptr<at::Half>());
+    const half *z_ptr = reinterpret_cast<const half *>(zeros.data_ptr<at::Half>());
+    half *y_ptr = reinterpret_cast<half *>(y.data_ptr<at::Half>());
+
+    // 给定一个block有128个threads
+    int threads = 128;
+    int warps_per_block = threads / 32;
+    int blocks = (N + warps_per_block - 1) / warps_per_block;
+
+    // 在pytorch当前流启动kernel
+    // 先指定stream为当前的pytorch流
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // 然后启动kernel！！！
+    gemv_kernel<<<blocks, threads, 0, stream>>>(x_ptr, w_ptr, s_ptr, z_ptr, y_ptr, K, N, group_size);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return y;
+}
+
+
+```
+
+新的测试结果是
+```
+[112779] python3.10@127.0.0.1
+  gemv_kernel(const __half *, const unsigned char *, const __half *, const__half *, __half *, int, int, int) (1024, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        10.99
+    SM Frequency                    Ghz         1.59
+    Elapsed Cycles                cycle       284290
+    Memory Throughput                 %        57.73
+    DRAM Throughput                   %        14.29
+    Duration                         us       177.82
+    L1/TEX Cache Throughput           %        59.43
+    L2 Cache Throughput               %         6.57
+    SM Active Cycles              cycle    275148.92
+    Compute (SM) Throughput           %        73.47
+    ----------------------- ----------- ------------
+
+    OPT   Compute is more heavily utilized than Memory: Look at the Compute Workload Analysis section to see what the   
+          compute pipelines are spending their time doing. Also, consider whether any computation is redundant and      
+          could be reduced or moved to look-up tables.                                             
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   128
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                   1024
+    Preferred Cluster Size                                         0
+    Registers Per Thread             register/thread              40
+    Shared Memory Configuration Size           Kbyte           32.77
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM              26
+    Stack Size                                                  1024
+    Threads                                   thread          131072
+    # TPCs                                                        13
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                                3.28
+    -------------------------------- --------------- ---------------
+
+    OPT   Est. Speedup: 25%                                             
+          A wave of thread blocks is defined as the maximum number of blocks that can be executed in parallel on the    
+          target GPU. The number of blocks in a wave depends on the numberof multiprocessors and the theoretical       
+          occupancy of the kernel. This kernel launch results in 3 full waves and a partial wave of 89 thread blocks.   
+          Under the assumption of a uniform execution duration of all thread blocks, this partial wave may account for  
+          up to 25.0% of the total runtime of this kernel. Try launching agrid with no partial wave. The overall       
+          impact of this tail effect also lessens with the number of full waves executed for a grid. See the Hardware   
+          Model (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-hw-model) description for     
+          more details on launch configurations.                                             
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block           12
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           12
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        87.62
+    Achieved Active Warps Per SM           warp        42.06
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 12.38%                                             
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (87.6%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                             
+
+    Section: GPU and Memory Workload Distribution
+    -------------------------- ----------- ------------
+    Metric Name                Metric Unit Metric Value
+    -------------------------- ----------- ------------
+    Average DRAM Active Cycles       cycle       279112
+    Total DRAM Elapsed Cycles        cycle      7815168
+    Average L1 Active Cycles         cycle    275148.92
+    Total L1 Elapsed Cycles          cycle      7364570
+    Average L2 Active Cycles         cycle    269373.31
+    Total L2 Elapsed Cycles          cycle      4408176
+    Average SM Active Cycles         cycle    275148.92
+    Total SM Elapsed Cycles          cycle      7364570
+    Average SMSP Active Cycles       cycle    274343.49
+    Total SMSP Elapsed Cycles        cycle     29458280
+    -------------------------- ----------- ------------
+```
+可以看到有一些提升了。我们的用时减少到了177.82us，计算下来，我们的有效带宽利用率达到13.1%  
+
+第一步已经提升了，我们现在看看第二种方法。也就是提示中说的**探索 uint32_t, uint2, uint4 向量化加载（Vectorized Load）。**  
+我先搜索了一下什么是**向量化加载**。他就是每个线程用一条更宽的加载指令，一次读取多个连续的数据元素。比如读取四个连续的32位整数，如果逐个读取就需要四条加载指令；但我们如果用CUDA的uint4来读取，就可以用一条128位的加载指令来读取。减少了加载指令的数量  
+现在每轮读取一个uint8_t，里面有2个INT4，但是只用了里面的一个来计算。  
+接下来我们保持一个warp计算一行，最后还是用shuffle求和。这里的第一轮，lane0读取0-3字节，计算0-7个权重；lane1读取4-7字节，计算8-15个权重。一个warp一轮就可以覆盖256个权重  
+然后我们让一个thread负责计算好这些，合并到sum中。  
+这么做就是减少了很多读取数据的时间，让warp中的线程合作读取  
+
+这一次的算子代码是  
+```
+__global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scales, const half *zeros, half *y, int K, int N, int group_size) {
+    // 现在计算当前的线程再warp中的编号
+    int lane = threadIdx.x % 32;
+    // 然后计算当前warp在block内的编号
+    int warp_id = threadIdx.x / 32;
+    // 计算每个block有多少个warp
+    int warps_per_block = blockDim.x / 32;
+    // 同一个warp内的32个线程计算同一行i
+    // 这里的i就是当前warp的全局编号
+    // 所以也相当于行号了
+    int i = blockIdx.x * warps_per_block + warp_id;
+    if(i >= N) {
+        return;
+    }
+
+    // 这个row代表当前第i行权重的起始地址
+    // 一行有K / 2个
+    const uint8_t *row = w_q + i * K / 2;
+    float sum = 0.0f;
+    // 下面的k代表包的编号
+    // 每个包有8个权重，总共K/8个包
+    // 一轮完成32个包，这样lane0负责0,32,64包，lane1是1，33,65包
+    for(int k = lane;k < K / 8;k += 32) {
+        // packed就是把四个字节合并
+        uint32_t packed = reinterpret_cast<const uint32_t *>(row)[k];
+
+        // group_index是就是计算当前到第几个组了
+        // 用的是当前到第几个权重，除以一组多少个权重来计算的
+        int group_index = i * K / group_size + k * 8 / group_size;
+
+
+        // 根据组号得到z和s
+        // 顺便补一下之前忘记的转换
+        float z = __half2float(zeros[group_index]);
+        float s = __half2float(scales[group_index]);
+
+        // 这里的m代表当前包内的第m个INT4权重，范围是0-7，因为一个包就是8个INT4
+        // 然后我们用按位与
+        // 把4位提取出来，给q
+        for(int m = 0; m < 8; m++) {
+            int q = (packed >> (m * 4)) & 0xF;
+
+            float xv = __half2float(x[k * 8 + m]);
+
+            float weight = (q - z) * s;
+            sum += xv * weight;
+        }
+    }
+
+    // 现在每个线程的sum都是自己的lane和32结合的产物
+    // 也就是这个sum就是第lane, lane + 32, lane + 64 ...的和
+    // 所以接下来合并
+    for(int j = 16;j > 0;j /= 2) {
+        // 这一行就是共享大家（warp内）的sum
+        // 然后每个线程都和比自己大16的加起来
+        // 变成第0个和第16个合并，第一个和第17个合并...
+        // 后面只剩下0到15
+        // 然后继续按照8为步长合并
+        // 以此类推一直到1
+        sum += __shfl_down_sync(0xffffffffu, sum, j);
+    }
+
+    // 最后大家的都加到了第0个上去
+    if(lane == 0) {
+        y[i] = __float2half_rn(sum);
+    }
+}
+```
+测试一下  
+
+```
+==PROF== Disconnected from process 159194
+[159194] python3.10@127.0.0.1
+  gemv_kernel(const __half *, const unsigned char *, const __half *, const__half *, __half *, int, int, int) (1024, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        10.99
+    SM Frequency                    Ghz         1.55
+    Elapsed Cycles                cycle       101977
+    Memory Throughput                 %        87.88
+    DRAM Throughput                   %        38.69
+    Duration                         us        65.60
+    L1/TEX Cache Throughput           %        92.78
+    L2 Cache Throughput               %        17.25
+    SM Active Cycles              cycle     96414.46
+    Compute (SM) Throughput           %        58.88
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of this device.  
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing L1 in the Memory Workload Analysis section.                                             
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   128
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                   1024
+    Preferred Cluster Size                                         0
+    Registers Per Thread             register/thread              36
+    Shared Memory Configuration Size           Kbyte           32.77
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM              26
+    Stack Size                                                  1024
+    Threads                                   thread          131072
+    # TPCs                                                        13
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                                3.28
+    -------------------------------- --------------- ---------------
+
+    OPT   Est. Speedup: 25%                                             
+          A wave of thread blocks is defined as the maximum number of blocks that can be executed in parallel on the    
+          target GPU. The number of blocks in a wave depends on the numberof multiprocessors and the theoretical       
+          occupancy of the kernel. This kernel launch results in 3 full waves and a partial wave of 89 thread blocks.   
+          Under the assumption of a uniform execution duration of all thread blocks, this partial wave may account for  
+          up to 25.0% of the total runtime of this kernel. Try launching agrid with no partial wave. The overall       
+          impact of this tail effect also lessens with the number of full waves executed for a grid. See the Hardware   
+          Model (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-hw-model) description for     
+          more details on launch configurations.                                             
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block           12
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           12
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        87.24
+    Achieved Active Warps Per SM           warp        41.87
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 12.76%                                             
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (87.2%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                             
+
+    Section: GPU and Memory Workload Distribution
+    -------------------------- ----------- ------------
+    Metric Name                Metric Unit Metric Value
+    -------------------------- ----------- ------------
+    Average DRAM Active Cycles       cycle       278944
+    Total DRAM Elapsed Cycles        cycle      2883584
+    Average L1 Active Cycles         cycle     96414.46
+    Total L1 Elapsed Cycles          cycle      2646830
+    Average L2 Active Cycles         cycle     95744.19
+    Total L2 Elapsed Cycles          cycle      1616800
+    Average SM Active Cycles         cycle     96414.46
+    Total SM Elapsed Cycles          cycle      2646830
+    Average SMSP Active Cycles       cycle     95859.73
+    Total SMSP Elapsed Cycles        cycle     10587320
+    -------------------------- ----------- ------------
+```
+可以计算到我们这一次的有效带宽利用率达到了35.4%  
