@@ -552,3 +552,211 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
     -------------------------- ----------- ------------
 ```
 可以计算到我们这一次的有效带宽利用率达到了35.4%  
+我忘了，既然都利用向量化加载了，怎么只加载了个w_q?我其实应该给x也来个向量化加载的，或许效率还能继续提升  
+原本只是想跟w_q一样，然后x的读取改成float xv =  (packed_x >> (m * 16)) & 0xFFFF;不过发生了一些类型转换的错误，查询资料知道，这样会把提取出的16位当成整数，再转成float。比如half是1.0，编码是0x3C00,就会变成15360.0  
+所以必须先按照half的位模式来解释，再转成float。也就是  
+```
+unsigned short bits = (packed_x >> (m * 16)) & 0xFFFFu;
+float xv = __half2float(__ushort_as_half(bits));
+```
+经过这次的优化我们成功达到  
+```
+==PROF== Disconnected from process 7715
+[7715] python3.10@127.0.0.1
+  gemv_kernel(const __half *, const unsigned char *, const __half *, const__half *, __half *, int, int, int) (1024, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        10.99
+    SM Frequency                    Ghz         1.53
+    Elapsed Cycles                cycle        76516
+    Memory Throughput                 %        50.74
+    DRAM Throughput                   %        50.74
+    Duration                         us        50.02
+    L1/TEX Cache Throughput           %        31.19
+    L2 Cache Throughput               %        22.73
+    SM Active Cycles              cycle     71717.77
+    Compute (SM) Throughput           %        75.60
+    ----------------------- ----------- ------------
+
+    OPT   Compute is more heavily utilized than Memory: Look at the Compute Workload Analysis section to see what the   
+          compute pipelines are spending their time doing. Also, consider whether any computation is redundant and      
+          could be reduced or moved to look-up tables.                                             
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   128
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                   1024
+    Preferred Cluster Size                                         0
+    Registers Per Thread             register/thread              38
+    Shared Memory Configuration Size           Kbyte           32.77
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM              26
+    Stack Size                                                  1024
+    Threads                                   thread          131072
+    # TPCs                                                        13
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                                3.28
+    -------------------------------- --------------- ---------------
+
+    OPT   Est. Speedup: 25%                                             
+          A wave of thread blocks is defined as the maximum number of blocks that can be executed in parallel on the    
+          target GPU. The number of blocks in a wave depends on the numberof multiprocessors and the theoretical       
+          occupancy of the kernel. This kernel launch results in 3 full waves and a partial wave of 89 thread blocks.   
+          Under the assumption of a uniform execution duration of all thread blocks, this partial wave may account for  
+          up to 25.0% of the total runtime of this kernel. Try launching agrid with no partial wave. The overall       
+          impact of this tail effect also lessens with the number of full waves executed for a grid. See the Hardware   
+          Model (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-hw-model) description for     
+          more details on launch configurations.                                             
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block           12
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           12
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        85.99
+    Achieved Active Warps Per SM           warp        41.28
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 14.01%                                             
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (86.0%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                             
+
+    Section: GPU and Memory Workload Distribution
+    -------------------------- ----------- ------------
+    Metric Name                Metric Unit Metric Value
+    -------------------------- ----------- ------------
+    Average DRAM Active Cycles       cycle       279032
+    Total DRAM Elapsed Cycles        cycle      2199552
+    Average L1 Active Cycles         cycle     71717.77
+    Total L1 Elapsed Cycles          cycle      1985778
+    Average L2 Active Cycles         cycle        71950
+    Total L2 Elapsed Cycles          cycle      1227664
+    Average SM Active Cycles         cycle     71717.77
+    Total SM Elapsed Cycles          cycle      1985778
+    Average SMSP Active Cycles       cycle     71343.67
+    Total SMSP Elapsed Cycles        cycle      7943112
+    -------------------------- ----------- ------------
+```
+经过计算，可以知道本地估算的有效带宽利用率**提升到了46%**  
+Nvidia Nsight Compute给出的建议是**Compute is more heavily utilized than Memory: Look at the  Compute Workload Analysis section to see what the compute pipelines are spending their time doing. Also, consider whether any computation is redundant and could be reduced or moved to look-up tables**  
+我们的Compute达到了75.6%而Memory只有50.74%，我们来看看能不能在计算方面进行一些优化  
+**查了一下，ncu可以进行一些检查，需要运行以下指令**  
+```
+ncu   --target-processes all   --kernel-name regex:gemv_kernel   --launch-skip 4   --launch-count 1   --section SpeedOfLight \
+--section ComputeWorkloadAnalysis \
+--section InstructionStats \
+--section SchedulerStats \
+--section WarpStateStats  python test_local.py
+```
+
+得到  
+```
+==PROF== Disconnected from process 9816
+[9816] python3.10@127.0.0.1
+  gemv_kernel(const __half *, const unsigned char *, const __half *, const__half *, __half *, int, int, int) (1024, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        10.97
+    SM Frequency                    Ghz         1.53
+    Elapsed Cycles                cycle        76729
+    Memory Throughput                 %        50.93
+    DRAM Throughput                   %        50.93
+    Duration                         us        49.95
+    L1/TEX Cache Throughput           %        31.11
+    L2 Cache Throughput               %        22.66
+    SM Active Cycles              cycle     71916.62
+    Compute (SM) Throughput           %        75.47
+    ----------------------- ----------- ------------
+
+    OPT   Compute is more heavily utilized than Memory: Look at the Compute Workload Analysis section to see what the   
+          compute pipelines are spending their time doing. Also, consider whether any computation is redundant and      
+          could be reduced or moved to look-up tables.                                             
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         3.21
+    Executed Ipc Elapsed  inst/cycle         3.02
+    Issue Slots Busy               %        75.47
+    Issued Ipc Active     inst/cycle         3.21
+    SM Busy                        %        75.47
+    -------------------- ----------- ------------
+
+    INF   Shared FMA Heavy is the highest-utilized pipeline (58.3%) based on elapsed cycles in the workload, taking     
+          into account the rates of its different instructions. It is a physical pipe and shared by the logical pipes   
+          FMA Heavy and ALU Lite. It's dominated by its FMA Heavy sub-pipeline. It is well-utilized, but should not be  
+          a bottleneck. Based on the number of executed instructions, the highest utilized pipeline (56.0%) is ALU      
+          Heavy. It is part of the aggregated pipe ALU. Comparing the two,the overall pipeline utilization appears to  
+          be caused by frequent, low-latency instructions. See the Profiling Guide                                      
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-decoder) or hover over the          
+          pipeline name to understand the workloads handled by each pipeline. The Instruction Statistics section shows  
+          the mix of executed instructions for this workload.                                             
+
+    Section: Scheduler Statistics
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    One or More Eligible                   %        80.71
+    Issued Warp Per Scheduler                        0.81
+    No Eligible                            %        19.29
+    Active Warps Per Scheduler          warp        10.36
+    Eligible Warps Per Scheduler        warp         5.50
+    ---------------------------- ----------- ------------
+
+    Section: Warp State Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Warp Cycles Per Issued Instruction             cycle        12.83
+    Warp Cycles Per Executed Instruction           cycle        12.83
+    Avg. Active Threads Per Warp                                31.87
+    Avg. Not Predicated Off Threads Per Warp                    30.39
+    ---------------------------------------- ----------- ------------
+
+    WRN   The optional metric smsp__pcsamp_sample_count could not be found. Collecting it as an additional metric could 
+          enable the rule to provide more guidance.                                             
+
+    Section: Instruction Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                  byte            0
+    Shared Memory Spilling Requests                 byte            0
+    Avg. Executed Instructions Per Scheduler        inst     57737.85
+    Executed Instructions                           inst      6004736
+    Avg. Issued Instructions Per Scheduler          inst     57737.85
+    Issued Instructions                             inst      6004736
+    ---------------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 12.05%                                             
+          This workload executes 524288 fused and 1069056 non-fused FP32 instructions. By converting pairs of non-fused 
+          instructions to their fused (https://docs.nvidia.com/cuda/floating-point/#cuda-and-floating-point),           
+          higher-throughput equivalent, the achieved FP32 performance could be increased by up to 34% (relative to its  
+          current performance). 
+```

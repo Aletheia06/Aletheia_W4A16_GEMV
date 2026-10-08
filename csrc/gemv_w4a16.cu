@@ -18,6 +18,7 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
     // 这个row代表当前第i行权重的起始地址
     // 一行有K / 2个
     const uint8_t *row = w_q + i * K / 2;
+
     float sum = 0.0f;
     // 下面的k代表包的编号
     // 每个包有8个权重，总共K/8个包
@@ -25,6 +26,10 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
     for(int k = lane;k < K / 8;k += 32) {
         // packed就是把四个字节合并
         uint32_t packed = reinterpret_cast<const uint32_t *>(row)[k];
+        
+        // 我这次给x也向量化加载
+        // packed_x就是16字节合并的x
+        __uint128_t packed_x = reinterpret_cast<const __uint128_t *>(x)[k];
 
         // group_index是就是计算当前到第几个组了
         // 用的是当前到第几个权重，除以一组多少个权重来计算的
@@ -42,7 +47,9 @@ __global__ void gemv_kernel(const half *x, const uint8_t *w_q, const half *scale
         for(int m = 0; m < 8; m++) {
             int q = (packed >> (m * 4)) & 0xF;
 
-            float xv = __half2float(x[k * 8 + m]);
+            //必须先按照half的位模式来解释，再转成float
+            unsigned short bits = (packed_x >> (m * 16)) & 0xFFFFu;
+            float xv = __half2float(__ushort_as_half(bits));
 
             float weight = (q - z) * s;
             sum += xv * weight;
