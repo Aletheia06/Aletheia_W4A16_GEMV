@@ -1,4 +1,35 @@
 # FUSED W4A16 GEMV 算子优化
+
+# 先学习一下怎么看Nvidia Nsight Compute
+1.DRAM Throughput是显存数据搬运能力用了多少，衡量显存访问相关硬件的吞吐量，相对于其峰值达到了多少，衡量的是搬运速度；影响因素是有没有持续、充足的显存访问请求  
+2.Compute(SM) Throughput是SM内最接近满负荷的处理环节用了多少。主要受到执行哪些指令，以及能否不断提供可执行的指令影响  
+3.Theoretical Occupancy是已驻留的 warp 数占硬件最多能容纳的 warp 数的比例
+4.Registers Per Thread就是编译器为每个线程分配的寄存器数量  
+5.Block Limit Registers是只考虑寄存器容量，一个SM最多同时驻留这么多个这样的block。因为SM的寄存器总量有限，每个block分走一部分，分给这么多个，剩下的资源就不够放下一个完整的block了  
+6.Waves Per SM是全部block的工作量相当于装满GPU多少轮.怎么计算的呢？比如GPU有26个SM，每个SM最多同时驻留12个block，所以一共可以同时312个block，如果启动了1024个block，那就是1024/312=3.28  
+7.Duration是这一次kernel在GPU上执行了多久，时间缩短才是最终的性能收益，对于这道题，Duration是最重要的  
+8.SM Frequency是测量周期内他的频率  
+9.Elapsed Cycles是整个测量期间经过了多少个核心时钟周期，其实也就是把Duration转化成了周期，大概就是Duration*1530  
+10.SM Active Cycles是平均每个SM有warp驻留的周期数。  
+11.Memory Throughput是访存路径中，相关处理细节最接近峰值的程度，相比于DRAM Throughput，Memory Throughput的范围更广，还涉及缓存和处理访存请求的硬件环节。它从相关子指标中取最高百分比，不是把各级吞吐率相加或平均  
+12.L1/TEX Cache Throughput是SM附近的缓存与访存处理单元有多接近处理能力上限  
+13.L2 Cache Throughput是全GPU共享的二级缓存有多接近处理能力上限  
+14.Share Memory Configuration Size是每个SM当前划给共享内存的容量  
+15.Static Shared Memory Per Block和Dynamic Share Memory Per Block和Driver Shared Memory Per Block都是看每个block的共享内存用量的。
+16.Total SM Elapsed Cycles是把所有SM经过的周期数加起来  
+17.Average SMSP Active Cycles是平均每个SM子分区有warp驻留的周期数。SMSP是SM内部的一个执行分区，每个SM有4个SMSP，各自有warp调度器和执行资源。warp分配到其中一个分区执行。一个SMSP至少有一个warp驻留，就记为活跃  
+18.Total SMSP Elapsed Cycles是把所有SM子分区经过的周期数加起来  
+19.Average DRAM Active Cycles是平均每个显存计数单元进行数据传输的活跃周期数  
+20.Total DRAM Elapsed Cycles是把所有显存计数单元经过的周期数加起来  
+21.Block Limit SM是SM本身能管理的驻留block数量上限，由硬件决定  
+22.Block Limit Barriers是同步屏障资源允许同时驻留多少block  
+23.TPCs是GPU中参与这次执行的TPC硬件组数，可以理解为SM外面的一层硬件分组，包含一个或者多个SM
+24.Stack Size是这次启动的时候每个GPU显存的调用栈大小  
+25.THread Block Cluster是让多个block组成一个可以协作的组。等于0表示没有启用显式cluster配置  
+26.Green Context式让某项CUDA工作使用指定的一部分GPU资源，等于0表示关闭  
+
+
+
 # 提高带宽利用率  
 在前面提交的那一份，已经实现了基础功能，可以准确计算结果了。接下来根据题目的要求，还得提高带宽利用率。  
 要提高利用率，先看看哪些地方可以被提高的。  
