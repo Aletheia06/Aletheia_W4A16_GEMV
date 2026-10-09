@@ -836,3 +836,31 @@ ncu   --target-processes all   --kernel-name regex:gemv_kernel   --launch-skip 4
 ```
 
 进行测试，有点失望，时间几乎没什么变化，只减少了3.4%，现在的利用率大概48.18%  
+到这里我已经很难想到什么可以优化的地方了，而且这半天连50%都没到，也是很奇怪。只好去问AI了。AI给了我一个新的测试命令，也就是**在原来命令的基础上加上了--clock-control none**  
+把测试命令换成  
+```
+ncu --target-processes all \
+  --kernel-name regex:gemv_kernel \
+  --launch-skip 4 --launch-count 1 --set basic \
+  --clock-control none \
+  python test_local.py --no-benchmark
+```
+再测试一下就会发现  
+```
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        10.97
+    SM Frequency                    Ghz         2.61
+    Elapsed Cycles                cycle        80440
+    Memory Throughput                 %        82.70
+    DRAM Throughput                   %        82.70
+    Duration                         us        30.75
+    L1/TEX Cache Throughput           %        32.18
+    L2 Cache Throughput               %        23.96
+    SM Active Cycles              cycle     69517.54
+    Compute (SM) Throughput           %        66.39
+    ----------------------- ----------- ------------
+```
+**这一次的Duration减少到了30.75us，U大概就是75.62%，**比上一次提升明显。可以看到的是**SM Frequency得到了大幅的提升，也就是说，GPU的SM频率提高了很多，我记得之前都是1.53左右的，这次到了2.61，很显然，就是SM频率提高实现的加速**  
